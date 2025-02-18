@@ -1,10 +1,10 @@
 import os
 import time
 import logging
+import json
 import requests
 import cloudscraper
 from dotenv import load_dotenv
-from requests_toolbelt.utils import dump
 
 # Configure logging
 logging.basicConfig(
@@ -26,20 +26,15 @@ CRUNCHYROLL_HISTORY_URL = (
 )
 ANILIST_GRAPHQL_URL = "https://graphql.anilist.co/"
 
-# Create a cloudscraper instance to handle requests
+# File to cache Crunchyroll history
+CR_HISTORY_FILE = "crunchyroll_history.json"
+
+# Create a cloudscraper instance
 scraper = cloudscraper.create_scraper()
 
 
-def log_request_response(response):
-    """Log detailed request and response information."""
-    data = dump.dump_all(response)
-    logger.debug(data.decode("utf-8"))
-
-
-def make_request(method, url, headers=None, json_data=None, retries=3, delay=60*5):
-    """
-    Make an HTTP request using the given method and handle retries for rate limiting.
-    """
+def make_request(method, url, headers=None, json_data=None, retries=3, delay=300):
+    """Make an HTTP request with retries."""
     for attempt in range(1, retries + 1):
         try:
             if method.lower() == "get":
@@ -71,43 +66,67 @@ def make_request(method, url, headers=None, json_data=None, retries=3, delay=60*
 
 
 def get_crunchyroll_history():
+    """
+    Retrieve Crunchyroll watch history.
+    Use a cached file if available; otherwise, fetch from the API.
+    """
+    if os.path.exists(CR_HISTORY_FILE):
+        with open(CR_HISTORY_FILE, "r") as f:
+            cached_data = json.load(f)
+        return cached_data.get("data", [])
+
+    logger.info("Fetching Crunchyroll history from API")
     headers = {
         "Authorization": f"Bearer {CRUNCHYROLL_ACCESS_TOKEN}",
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36"
+        ),
         "Referer": "https://www.crunchyroll.com/",
         "Origin": "https://www.crunchyroll.com",
         "Sec-Fetch-Site": "same-origin"
     }
     response = make_request("get", CRUNCHYROLL_HISTORY_URL, headers=headers)
     if response:
-        return response.json().get("data", [])
-    else:
-        logger.error("Failed to fetch Crunchyroll history.")
-        return []
+        json_data = response.json()
+        with open(CR_HISTORY_FILE, "w") as f:
+            json.dump(json_data, f, indent=4)
+        return json_data.get("data", [])
+
+    logger.error("Failed to fetch Crunchyroll history.")
+    return []
 
 
-# Cache to store search results and avoid duplicate API calls
-anime_search_cache = {}
-
-
-def search_anilist_anime(title, retries=3, delay=60*5):
-    if title in anime_search_cache:
-        return anime_search_cache[title]
-
-    query = """
-    query ($search: String) {
-      Media (search: $search, type: ANIME) {
-        id
-        title {
-          romaji
-          english
-        }
-      }
-    }
+def get_anilist_media_and_progress(series_list, retries=3, delay=300):
     """
-    variables = {"search": title}
+    Given a list of series (each with 'series_title' and 'episode_number'),
+    perform a single GraphQL query to fetch AniList media info and current progress.
+    Returns a dict mapping each alias (media0, media1, ...) to media data.
+    """
+    query_parts = []
+    variables = {}
+    for i, series in enumerate(series_list):
+        alias = f"media{i}"
+        var_name = f"title{i}"
+        query_parts.append(f"""
+        {alias}: Media(search: ${var_name}, type: ANIME) {{
+            id
+            title {{
+                romaji
+                english
+            }}
+            mediaListEntry {{
+                progress
+            }}
+        }}
+        """)
+        variables[var_name] = series["series_title"]
+
+    query_vars = ", ".join([f"${var}: String!" for var in variables])
+    query_body = "\n".join(query_parts)
+    query = f"query ({query_vars}) {{\n{query_body}\n}}"
+
     headers = {
         "Authorization": f"Bearer {ANILIST_ACCESS_TOKEN}",
         "Content-Type": "application/json",
@@ -116,79 +135,50 @@ def search_anilist_anime(title, retries=3, delay=60*5):
         "Origin": "https://anilist.co",
     }
     response = make_request(
-        "post", ANILIST_GRAPHQL_URL, headers=headers, json_data={"query": query, "variables": variables},
-        retries=retries, delay=delay
+        "post",
+        ANILIST_GRAPHQL_URL,
+        headers=headers,
+        json_data={"query": query, "variables": variables},
+        retries=retries,
+        delay=delay
     )
     if response:
         data = response.json()
-        if "data" in data and "Media" in data["data"]:
-            anime = data["data"]["Media"]
-            anime_search_cache[title] = anime
-            return anime
-        else:
-            logger.error(
-                f"Unexpected response format for title '{title}': {data}")
-    return None
-
-
-def get_anilist_progress(anime_ids, retries=3, delay=60*5):
-    """
-    Fetch current progress for multiple anime in one request.
-    """
-    if not anime_ids:
-        return {}
-
-    query = """
-    query ($ids: [Int]) {
-      Page {
-        mediaList(mediaId_in: $ids, type: ANIME) {
-          mediaId
-          progress
-        }
-      }
-    }
-    """
-    variables = {"ids": anime_ids}
-    headers = {
-        "Authorization": f"Bearer {ANILIST_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Referer": "https://anilist.co/",
-        "Origin": "https://anilist.co",
-    }
-    response = make_request(
-        "post", ANILIST_GRAPHQL_URL, headers=headers, json_data={"query": query, "variables": variables},
-        retries=retries, delay=delay
-    )
-    if response:
-        data = response.json()
-        if "data" in data and "Page" in data["data"]:
-            return {entry["mediaId"]: entry["progress"] for entry in data["data"]["Page"]["mediaList"]}
-        else:
-            logger.error(
-                f"Unexpected response format in get_anilist_progress: {data}")
+        if "data" in data:
+            return data["data"]
+        logger.error(f"Unexpected response format: {data}")
     return {}
 
 
 def batch_update_anilist_progress(anime_updates, retries=3, delay=60*5):
     """
-    Batch update AniList progress for multiple anime entries.
+    Batch update AniList progress for multiple anime entries using GraphQL aliasing.
+    Each update is performed using the SaveMediaListEntry mutation.
     """
     if not anime_updates:
         logger.info("No updates needed. All anime are already up to date.")
         return
 
-    mutation = """
-    mutation batchUpdate($updates: [MediaListEntryUpdateInput]) {
-      UpdateMediaListEntries(entries: $updates) {
-        id
-        progress
-      }
-    }
-    """
-    updates = [{"mediaId": media_id, "progress": progress}
-               for media_id, progress in anime_updates.items()]
-    variables = {"updates": updates}
+    query_parts = []
+    variables = {}
+    for i, (media_id, progress) in enumerate(anime_updates.items()):
+        alias = f"update{i}"
+        var_media_id = f"mediaId{i}"
+        var_progress = f"progress{i}"
+        query_parts.append(
+            f"""{alias}: SaveMediaListEntry(mediaId: ${var_media_id}, progress: ${var_progress}) {{
+    id
+    progress
+}}"""
+        )
+        variables[var_media_id] = media_id
+        variables[var_progress] = progress
+
+    # Declare all variables as Int! (mediaId and progress are both integers)
+    var_declarations = ", ".join([f"${key}: Int!" for key in variables])
+    query_body = "\n".join(query_parts)
+    query = f"mutation ({var_declarations}) {{\n{query_body}\n}}"
+
     headers = {
         "Authorization": f"Bearer {ANILIST_ACCESS_TOKEN}",
         "Content-Type": "application/json",
@@ -197,8 +187,12 @@ def batch_update_anilist_progress(anime_updates, retries=3, delay=60*5):
         "Origin": "https://anilist.co",
     }
     response = make_request(
-        "post", ANILIST_GRAPHQL_URL, headers=headers, json_data={"query": mutation, "variables": variables},
-        retries=retries, delay=delay
+        "post",
+        ANILIST_GRAPHQL_URL,
+        headers=headers,
+        json_data={"query": query, "variables": variables},
+        retries=retries,
+        delay=delay
     )
     if response:
         logger.info(
@@ -207,49 +201,93 @@ def batch_update_anilist_progress(anime_updates, retries=3, delay=60*5):
     return None
 
 
-def sync_crunchyroll_to_anilist():
-    history = get_crunchyroll_history()
-    if not history:
-        logger.error("No history data found.")
-        return
-
-    anime_updates = {}
-    anime_ids = set()
-
+def get_distinct_series_latest_completed(history):
+    """
+    From the Crunchyroll history, return a list of distinct series with their latest fully watched episode.
+    If the highest-numbered episode is incomplete, the function checks previous episodes.
+    """
+    series_entries = {}
     for entry in history:
         metadata = entry.get("panel", {}).get("episode_metadata", {})
         title = metadata.get("series_title")
         episode = metadata.get("episode_number")
-        fully_watched = entry.get("fully_watched", False)
-
         if not title or episode is None:
-            logger.warning(f"Skipping entry due to missing data: {entry}")
             continue
+        series_entries.setdefault(title, []).append(entry)
 
-        if not fully_watched:
-            logger.info(
-                f"Skipping '{title}' Episode {episode} (Not fully watched).")
-            continue
+    distinct_series = []
+    for title, entries in series_entries.items():
+        sorted_entries = sorted(
+            entries,
+            key=lambda e: e.get("panel", {}).get(
+                "episode_metadata", {}).get("episode_number", 0),
+            reverse=True
+        )
+        latest_completed = next(
+            (entry for entry in sorted_entries if entry.get(
+                "fully_watched", False)), None
+        )
+        if latest_completed:
+            episode_num = latest_completed["panel"]["episode_metadata"]["episode_number"]
+            distinct_series.append({
+                "series_title": title,
+                "episode_number": episode_num,
+                "entry": latest_completed
+            })
+        else:
+            logger.warning(
+                f"No fully watched episode found for series: {title}")
 
-        anime = search_anilist_anime(title)
-        if anime:
-            anime_id = anime.get("id")
-            if anime_id:
-                anime_ids.add(anime_id)
-                # If multiple entries exist for the same anime, use the highest episode number.
-                anime_updates[anime_id] = max(
-                    anime_updates.get(anime_id, 0), episode)
+    return distinct_series
 
-    # Fetch current progress in one batch call
-    current_progress = get_anilist_progress(list(anime_ids))
 
-    # Filter out unnecessary updates
-    updates_to_apply = {
-        anime_id: ep for anime_id, ep in anime_updates.items()
-        if current_progress.get(anime_id, 0) < ep
-    }
-    batch_update_anilist_progress(updates_to_apply)
+def sync_crunchyroll_to_anilist_combined():
+    """
+    Fetch Crunchyroll history, compare each series' latest fully watched episode with AniList progress,
+    and update AniList if the Crunchyroll progress is higher.
+    """
+    history = get_crunchyroll_history()
+    if not history:
+        logger.error("No Crunchyroll history data found.")
+        return
+
+    distinct_series = get_distinct_series_latest_completed(history)
+    logger.info("Distinct series with latest fully watched episode:")
+    for series in distinct_series:
+        logger.info(
+            f"{series['series_title']}: Episode {series['episode_number']}")
+
+    anilist_data = get_anilist_media_and_progress(distinct_series)
+    updates_to_apply = {}
+    for i, series in enumerate(distinct_series):
+        alias = f"media{i}"
+        media = anilist_data.get(alias)
+        if media:
+            anime_id = media.get("id")
+            current_progress = (media.get("mediaListEntry")
+                                or {}).get("progress", 0)
+            crunchyroll_episode = series["episode_number"]
+            if crunchyroll_episode > current_progress:
+                updates_to_apply[anime_id] = crunchyroll_episode
+                logger.info(
+                    f"Will update {series['series_title']} (ID: {anime_id}): "
+                    f"Crunchyroll episode {crunchyroll_episode} vs AniList {current_progress}"
+                )
+            else:
+                logger.info(
+                    f"No update needed for {series['series_title']} (ID: {anime_id}): "
+                    f"Crunchyroll episode {crunchyroll_episode} vs AniList {current_progress}"
+                )
+        else:
+            logger.warning(
+                f"No AniList entry found for title: {series['series_title']}")
+
+    if updates_to_apply:
+        result = batch_update_anilist_progress(updates_to_apply)
+        logger.info(f"Update result: {result}")
+    else:
+        logger.info("No updates needed; AniList progress is already current.")
 
 
 if __name__ == '__main__':
-    sync_crunchyroll_to_anilist()
+    sync_crunchyroll_to_anilist_combined()
